@@ -3,8 +3,10 @@ import sqlite3
 import hashlib
 import datetime
 import os
+import json
 
 DB_FILE = "chat_app.db"
+DATA_FILE = "chat_data.json"
 
 # ---------------------- DB FUNCTIONS ---------------------- #
 def get_conn():
@@ -12,7 +14,6 @@ def get_conn():
 
 def init_db():
     with get_conn() as conn:
-        # Users table
         conn.execute("""
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -22,7 +23,6 @@ def init_db():
             created_at TEXT NOT NULL
         );""")
 
-        # Messages table
         conn.execute("""
         CREATE TABLE IF NOT EXISTS messages (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -33,7 +33,6 @@ def init_db():
             is_group INTEGER NOT NULL DEFAULT 0
         );""")
 
-        # Groups table
         conn.execute("""
         CREATE TABLE IF NOT EXISTS groups (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -42,7 +41,6 @@ def init_db():
             created_at TEXT NOT NULL
         );""")
 
-        # Group members table
         conn.execute("""
         CREATE TABLE IF NOT EXISTS group_members (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -50,19 +48,26 @@ def init_db():
             username TEXT NOT NULL
         );""")
 
-        # ✅ Migration check for missing is_group column
-        try:
-            conn.execute("ALTER TABLE messages ADD COLUMN is_group INTEGER NOT NULL DEFAULT 0;")
-        except sqlite3.OperationalError:
-            pass
-
         conn.commit()
+
+# ---------------------- JSON FUNCTIONS ---------------------- #
+def load_data():
+    if not os.path.exists(DATA_FILE):
+        with open(DATA_FILE, "w") as f:
+            json.dump({"users": {}, "messages": [], "groups": {}}, f)
+    with open(DATA_FILE, "r") as f:
+        return json.load(f)
+
+def save_data(data):
+    with open(DATA_FILE, "w") as f:
+        json.dump(data, f, indent=4)
 
 # ---------------------- AUTH FUNCTIONS ---------------------- #
 def hash_password(password):
     return hashlib.sha256(password.encode()).hexdigest()
 
-def signup(username, password):
+# ---- SQLite ----
+def signup_sql(username, password):
     with get_conn() as conn:
         try:
             conn.execute(
@@ -74,7 +79,7 @@ def signup(username, password):
         except sqlite3.IntegrityError:
             return False
 
-def login(username, password):
+def login_sql(username, password):
     with get_conn() as conn:
         row = conn.execute(
             "SELECT id FROM users WHERE username=? AND password_hash=?",
@@ -86,17 +91,50 @@ def login(username, password):
             return True
     return False
 
-def logout(username):
+def logout_sql(username):
     with get_conn() as conn:
         conn.execute("UPDATE users SET online=0 WHERE username=?", (username,))
         conn.commit()
 
-def get_online_users():
+def get_online_users_sql():
     with get_conn() as conn:
         return [row[0] for row in conn.execute("SELECT username FROM users WHERE online=1").fetchall()]
 
+# ---- JSON ----
+def signup_json(username, password):
+    data = load_data()
+    if username in data["users"]:
+        return False
+    data["users"][username] = {
+        "password_hash": hash_password(password),
+        "online": 0,
+        "created_at": str(datetime.datetime.now())
+    }
+    save_data(data)
+    return True
+
+def login_json(username, password):
+    data = load_data()
+    user = data["users"].get(username)
+    if user and user["password_hash"] == hash_password(password):
+        data["users"][username]["online"] = 1
+        save_data(data)
+        return True
+    return False
+
+def logout_json(username):
+    data = load_data()
+    if username in data["users"]:
+        data["users"][username]["online"] = 0
+        save_data(data)
+
+def get_online_users_json():
+    data = load_data()
+    return [u for u, info in data["users"].items() if info["online"] == 1]
+
 # ---------------------- CHAT FUNCTIONS ---------------------- #
-def send_message(sender, receiver, msg, is_group=0):
+# ---- SQLite ----
+def send_message_sql(sender, receiver, msg, is_group=0):
     with get_conn() as conn:
         conn.execute(
             "INSERT INTO messages (sender, receiver, msg, time, is_group) VALUES (?, ?, ?, ?, ?)",
@@ -104,22 +142,47 @@ def send_message(sender, receiver, msg, is_group=0):
         )
         conn.commit()
 
-def get_conversation(a, b, is_group=0):
+def get_conversation_sql(a, b, is_group=0):
     with get_conn() as conn:
         if is_group:
             rows = conn.execute(
                 "SELECT sender, msg, time FROM messages WHERE is_group=1 AND receiver=? ORDER BY id ASC",
                 (b,)
             ).fetchall()
+            return rows
         else:
             rows = conn.execute(
                 "SELECT sender, receiver, msg, time FROM messages WHERE is_group=0 AND ((sender=? AND receiver=?) OR (sender=? AND receiver=?)) ORDER BY id ASC",
                 (a, b, b, a)
             ).fetchall()
-        return rows
+            return rows
+
+# ---- JSON ----
+def send_message_json(sender, receiver, msg, is_group=0):
+    data = load_data()
+    data["messages"].append({
+        "sender": sender,
+        "receiver": receiver,
+        "msg": msg,
+        "time": str(datetime.datetime.now()),
+        "is_group": is_group
+    })
+    save_data(data)
+
+def get_conversation_json(a, b, is_group=0):
+    data = load_data()
+    if is_group:
+        return [(m["sender"], m["msg"], m["time"]) for m in data["messages"] if m["is_group"] == 1 and m["receiver"] == b]
+    else:
+        return [(m["sender"], m["receiver"], m["msg"], m["time"]) for m in data["messages"]
+                if m["is_group"] == 0 and (
+                    (m["sender"] == a and m["receiver"] == b) or
+                    (m["sender"] == b and m["receiver"] == a)
+                )]
 
 # ---------------------- GROUP FUNCTIONS ---------------------- #
-def create_group(group_name, created_by):
+# ---- SQLite ----
+def create_group_sql(group_name, created_by):
     with get_conn() as conn:
         try:
             conn.execute(
@@ -131,7 +194,7 @@ def create_group(group_name, created_by):
         except sqlite3.IntegrityError:
             return False
 
-def add_member(group_name, username):
+def add_member_sql(group_name, username):
     with get_conn() as conn:
         group_id = conn.execute("SELECT id FROM groups WHERE group_name=?", (group_name,)).fetchone()
         if group_id:
@@ -143,7 +206,7 @@ def add_member(group_name, username):
             return True
         return False
 
-def get_user_groups(username):
+def get_user_groups_sql(username):
     with get_conn() as conn:
         rows = conn.execute("""
             SELECT g.group_name FROM groups g
@@ -152,30 +215,66 @@ def get_user_groups(username):
         """, (username,)).fetchall()
         return [r[0] for r in rows]
 
+# ---- JSON ----
+def create_group_json(group_name, created_by):
+    data = load_data()
+    if group_name in data["groups"]:
+        return False
+    data["groups"][group_name] = {
+        "created_by": created_by,
+        "created_at": str(datetime.datetime.now()),
+        "members": [created_by]
+    }
+    save_data(data)
+    return True
+
+def add_member_json(group_name, username):
+    data = load_data()
+    if group_name in data["groups"]:
+        if username not in data["groups"][group_name]["members"]:
+            data["groups"][group_name]["members"].append(username)
+            save_data(data)
+            return True
+    return False
+
+def get_user_groups_json(username):
+    data = load_data()
+    return [g for g, info in data["groups"].items() if username in info["members"]]
+
 # ---------------------- STREAMLIT APP ---------------------- #
 st.set_page_config(page_title="💬 Wizzy Chat", page_icon="💬", layout="centered")
 init_db()
 
 if "user" not in st.session_state:
     st.session_state.user = None
+if "backend" not in st.session_state:
+    st.session_state.backend = "SQLite"
 
+# Sidebar toggle
+st.sidebar.title("⚙️ Settings")
+st.session_state.backend = st.sidebar.radio("Storage Backend", ["SQLite", "JSON"])
+
+backend = st.session_state.backend
+
+# ---------------------- LOGIN / SIGNUP ---------------------- #
 if st.session_state.user is None:
     st.title("🔑 Login / Sign Up")
 
     choice = st.radio("Choose:", ["Login", "Sign Up"])
-
     username = st.text_input("Username")
     password = st.text_input("Password", type="password")
 
     if choice == "Sign Up":
         if st.button("Sign Up"):
-            if signup(username, password):
+            success = signup_sql(username, password) if backend == "SQLite" else signup_json(username, password)
+            if success:
                 st.success("Account created. Please login!")
             else:
                 st.error("Username already taken!")
     else:
         if st.button("Login"):
-            if login(username, password):
+            success = login_sql(username, password) if backend == "SQLite" else login_json(username, password)
+            if success:
                 st.session_state.user = username
                 st.rerun()
             else:
@@ -184,18 +283,21 @@ if st.session_state.user is None:
 else:
     st.sidebar.title(f"Welcome {st.session_state.user} 👋")
     if st.sidebar.button("Logout"):
-        logout(st.session_state.user)
+        if backend == "SQLite":
+            logout_sql(st.session_state.user)
+        else:
+            logout_json(st.session_state.user)
         st.session_state.user = None
         st.rerun()
 
-    online_users = get_online_users()
+    online_users = get_online_users_sql() if backend == "SQLite" else get_online_users_json()
     st.sidebar.subheader("🟢 Online Users")
     for u in online_users:
         if u != st.session_state.user:
             st.sidebar.write(u)
 
+    my_groups = get_user_groups_sql(st.session_state.user) if backend == "SQLite" else get_user_groups_json(st.session_state.user)
     st.sidebar.subheader("👥 Groups")
-    my_groups = get_user_groups(st.session_state.user)
     for g in my_groups:
         st.sidebar.write(f"📌 {g}")
 
@@ -205,7 +307,7 @@ else:
     if chat_mode == "Private Chat":
         chat_with = st.selectbox("Select a user", [u for u in online_users if u != st.session_state.user])
         if chat_with:
-            history = get_conversation(st.session_state.user, chat_with)
+            history = get_conversation_sql(st.session_state.user, chat_with) if backend == "SQLite" else get_conversation_json(st.session_state.user, chat_with)
             st.subheader(f"Chat with {chat_with}")
             for sender, receiver, msg, time in history:
                 align = "➡️" if sender == st.session_state.user else "⬅️"
@@ -214,7 +316,10 @@ else:
             new_msg = st.text_input("Type a message...")
             if st.button("Send"):
                 if new_msg.strip():
-                    send_message(st.session_state.user, chat_with, new_msg)
+                    if backend == "SQLite":
+                        send_message_sql(st.session_state.user, chat_with, new_msg)
+                    else:
+                        send_message_json(st.session_state.user, chat_with, new_msg)
                     st.rerun()
 
     else:  # Group Chat
@@ -223,16 +328,20 @@ else:
         if group_action == "Create Group":
             group_name = st.text_input("Group Name")
             if st.button("Create Group"):
-                if create_group(group_name, st.session_state.user):
-                    add_member(group_name, st.session_state.user)
+                created = create_group_sql(group_name, st.session_state.user) if backend == "SQLite" else create_group_json(group_name, st.session_state.user)
+                if created:
+                    if backend == "SQLite":
+                        add_member_sql(group_name, st.session_state.user)
+                    else:
+                        add_member_json(group_name, st.session_state.user)
                     st.success(f"Group '{group_name}' created!")
                 else:
                     st.error("Group already exists!")
         else:
-            group_list = get_user_groups(st.session_state.user)
+            group_list = get_user_groups_sql(st.session_state.user) if backend == "SQLite" else get_user_groups_json(st.session_state.user)
             group_choice = st.selectbox("Select Group", group_list)
             if group_choice:
-                history = get_conversation(st.session_state.user, group_choice, is_group=1)
+                history = get_conversation_sql(st.session_state.user, group_choice, is_group=1) if backend == "SQLite" else get_conversation_json(st.session_state.user, group_choice, is_group=1)
                 st.subheader(f"Group Chat: {group_choice}")
                 for sender, msg, time in history:
                     align = "➡️" if sender == st.session_state.user else "⬅️"
@@ -241,5 +350,8 @@ else:
                 new_msg = st.text_input("Type a message...")
                 if st.button("Send"):
                     if new_msg.strip():
-                        send_message(st.session_state.user, group_choice, new_msg, is_group=1)
+                        if backend == "SQLite":
+                            send_message_sql(st.session_state.user, group_choice, new_msg, is_group=1)
+                        else:
+                            send_message_json(st.session_state.user, group_choice, new_msg, is_group=1)
                         st.rerun()
